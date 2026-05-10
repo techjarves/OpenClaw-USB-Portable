@@ -75,7 +75,7 @@ Use `Setup / Change AI` first to configure your model provider. After setup, use
 `Run OpenClaw Command` is available for commands shown by OpenClaw itself, for example:
 
 ```text
-openclaw pairing approve telegram R2F8ZL5S
+openclaw pairing approve telegram --------
 ```
 
 ## Portable Data Model

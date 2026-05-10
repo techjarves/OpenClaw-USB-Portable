@@ -1,4 +1,6 @@
 $ErrorActionPreference = "Stop"
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
 $Root = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $Platform = "windows-x64"
@@ -318,6 +320,70 @@ function Invoke-OpenClaw([string[]]$Arguments) {
   & $NodeExe $OpenClawEntry @Arguments
 }
 
+function Get-PortableGatewaySettings {
+  $settings = [ordered]@{
+    Port = "18789"
+    Bind = "loopback"
+    AuthMode = "none"
+    Token = $null
+    Password = $null
+  }
+
+  try {
+    if (Test-Path -LiteralPath $env:OPENCLAW_CONFIG_PATH) {
+      $config = Get-Content -LiteralPath $env:OPENCLAW_CONFIG_PATH -Raw | ConvertFrom-Json
+      if ($config.gateway.port) { $settings.Port = [string]$config.gateway.port }
+      if ($config.gateway.bind) { $settings.Bind = [string]$config.gateway.bind }
+      if ($config.gateway.auth.mode) { $settings.AuthMode = [string]$config.gateway.auth.mode }
+      if ($config.gateway.auth.token) { $settings.Token = [string]$config.gateway.auth.token }
+      if ($config.gateway.auth.password) { $settings.Password = [string]$config.gateway.auth.password }
+    }
+  } catch {
+    Write-Host "Could not read gateway config; using portable defaults." -ForegroundColor Yellow
+  }
+
+  return [pscustomobject]$settings
+}
+
+function Get-GatewayRunArguments {
+  $settings = Get-PortableGatewaySettings
+  $arguments = @("gateway", "run", "--port", $settings.Port, "--bind", $settings.Bind, "--auth", $settings.AuthMode, "--verbose")
+
+  if ($settings.AuthMode -eq "token" -and $settings.Token) {
+    $arguments += @("--token", $settings.Token)
+  } elseif ($settings.AuthMode -eq "password" -and $settings.Password) {
+    $arguments += @("--password", $settings.Password)
+  }
+
+  return $arguments
+}
+
+function Get-GatewayHealthArguments {
+  $settings = Get-PortableGatewaySettings
+  $arguments = @("gateway", "health", "--timeout", "2500")
+
+  if ($settings.AuthMode -eq "token" -and $settings.Token) {
+    $arguments += @("--token", $settings.Token)
+  } elseif ($settings.AuthMode -eq "password" -and $settings.Password) {
+    $arguments += @("--password", $settings.Password)
+  }
+
+  return $arguments
+}
+
+function Add-GatewayClientAuthArguments([string[]]$Arguments) {
+  $settings = Get-PortableGatewaySettings
+  $out = @($Arguments)
+
+  if ($settings.AuthMode -eq "token" -and $settings.Token -and -not ($out -contains "--token")) {
+    $out += @("--token", $settings.Token)
+  } elseif ($settings.AuthMode -eq "password" -and $settings.Password -and -not ($out -contains "--password")) {
+    $out += @("--password", $settings.Password)
+  }
+
+  return $out
+}
+
 function Split-CommandLine([string]$CommandLine) {
   $tokens = New-Object System.Collections.Generic.List[string]
   $current = New-Object System.Text.StringBuilder
@@ -374,57 +440,20 @@ function Invoke-OpenClawCommandPrompt {
     return
   }
 
-  $stdoutLog = Join-Path $Root "logs\openclaw-command.out.log"
-  $stderrLog = Join-Path $Root "logs\openclaw-command.err.log"
-  Remove-Item -LiteralPath $stdoutLog, $stderrLog -Force -ErrorAction SilentlyContinue
-
   Write-Host
-  Write-Host "[portable-openclaw] Running OpenClaw command. Timeout: 90s" -ForegroundColor Cyan
-  $process = Start-Process `
-    -FilePath $NodeExe `
-    -ArgumentList (Join-ProcessArguments (@($OpenClawEntry) + $arguments)) `
-    -WorkingDirectory $Root `
-    -RedirectStandardOutput $stdoutLog `
-    -RedirectStandardError $stderrLog `
-    -WindowStyle Hidden `
-    -PassThru
-
-  $timer = [Diagnostics.Stopwatch]::StartNew()
-  while (-not $process.HasExited -and $timer.Elapsed.TotalSeconds -lt 90) {
-    Write-LiveStatus ("[portable-openclaw] Command running | {0} | logs\openclaw-command.out.log" -f (Format-Duration $timer.Elapsed.TotalSeconds))
-    Start-Sleep -Milliseconds 500
-    $process.Refresh()
-  }
-  Complete-LiveStatus
-
-  if (-not $process.HasExited) {
-    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-    Write-Host "OpenClaw command timed out after 90 seconds." -ForegroundColor Yellow
-  } else {
-    $process.WaitForExit()
-    $process.Refresh()
-  }
-
-  foreach ($log in @($stdoutLog, $stderrLog)) {
-    if (Test-Path -LiteralPath $log) {
-      $lines = Get-Content -LiteralPath $log -Tail 80
-      if ($lines) {
-        Write-Host
-        Write-Host "--- $(Get-RelativePathText $log) ---" -ForegroundColor DarkGray
-        $lines
-      }
-    }
-  }
-
-  if ($process.HasExited -and $process.ExitCode -ne 0) {
-    Write-Host "OpenClaw command exited with code $($process.ExitCode)." -ForegroundColor Yellow
+  Write-Host "[portable-openclaw] Running OpenClaw command live. Press Ctrl+C to stop it." -ForegroundColor Cyan
+  & $NodeExe $OpenClawEntry @arguments
+  $exitCode = $LASTEXITCODE
+  if ($exitCode -ne 0) {
+    Write-Host "OpenClaw command exited with code $exitCode." -ForegroundColor Yellow
   }
 }
 
 function Test-GatewayPort {
+  $settings = Get-PortableGatewaySettings
   try {
     $client = New-Object Net.Sockets.TcpClient
-    $iar = $client.BeginConnect("127.0.0.1", 18789, $null, $null)
+    $iar = $client.BeginConnect("127.0.0.1", ([int]$settings.Port), $null, $null)
     $ok = $iar.AsyncWaitHandle.WaitOne(500, $false)
     if ($ok) { $client.EndConnect($iar) }
     $client.Close()
@@ -437,17 +466,39 @@ function Test-GatewayPort {
 function Test-GatewayHealthy {
   if (-not (Test-GatewayPort)) { return $false }
   try {
-    Invoke-OpenClaw @("gateway", "health") *> $null
+    Invoke-OpenClaw (Get-GatewayHealthArguments) *> $null
     return ($LASTEXITCODE -eq 0)
   } catch {
     return $false
   }
 }
 
+function Test-GatewayReadyFromLog {
+  if (-not (Test-GatewayPort)) { return $false }
+  if (-not (Test-Path -LiteralPath $GatewayLog)) { return $false }
+
+  $tail = Get-Content -LiteralPath $GatewayLog -Tail 80 -ErrorAction SilentlyContinue
+  return [bool]($tail | Where-Object { $_ -match "\[gateway\].*ready" } | Select-Object -Last 1)
+}
+
 function Stop-Gateway {
-  Get-Process node -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -like "*runtime\$Platform*" } |
-    Stop-Process -Force -ErrorAction SilentlyContinue
+  $processes = @(Get-Process node -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -like "*runtime\$Platform*" })
+
+  if ($processes.Count -eq 0) {
+    Write-Host "Gateway is not running." -ForegroundColor Yellow
+    return
+  }
+
+  Write-Step "Stopping Gateway process(es): $($processes.Id -join ', ')"
+  $processes | Stop-Process -Force -ErrorAction SilentlyContinue
+  Start-Sleep -Milliseconds 500
+
+  if (Test-GatewayPort) {
+    Write-Host "Gateway port is still open after stop attempt." -ForegroundColor Yellow
+  } else {
+    Write-Host "Gateway stopped." -ForegroundColor Green
+  }
 }
 
 function Show-GatewayLogTail {
@@ -466,10 +517,41 @@ function Show-GatewayLogTail {
     Write-Host "--- end gateway errors ---" -ForegroundColor DarkGray
     $shown = $true
   }
+  $nativeLog = Get-ChildItem -LiteralPath (Join-Path $Root "data\temp\openclaw") -Filter "openclaw-*.log" -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+  if ($nativeLog) {
+    Write-Host
+    Write-Host "--- OpenClaw native log: $($nativeLog.FullName) ---" -ForegroundColor DarkGray
+    Get-Content -LiteralPath $nativeLog.FullName -Tail 40
+    Write-Host "--- end native log ---" -ForegroundColor DarkGray
+    $shown = $true
+  }
   if (-not $shown) {
     Write-Host
     Write-Host "No Gateway log files were created." -ForegroundColor Yellow
   }
+}
+
+function Get-GatewayStartupMilestone {
+  if (-not (Test-Path -LiteralPath $GatewayLog)) {
+    return $null
+  }
+
+  $tail = Get-Content -LiteralPath $GatewayLog -Tail 25 -ErrorAction SilentlyContinue
+  foreach ($pattern in @(
+    "ready",
+    "http server listening",
+    "starting channels and sidecars",
+    "loaded .* plugin",
+    "starting HTTP server",
+    "starting..."
+  )) {
+    $match = $tail | Where-Object { $_ -match $pattern } | Select-Object -Last 1
+    if ($match) { return ($match -replace "`e\[[0-9;]*m", "") }
+  }
+
+  return $null
 }
 
 function Start-Gateway([switch]$Force) {
@@ -477,7 +559,8 @@ function Start-Gateway([switch]$Force) {
     Stop-Gateway
     Start-Sleep -Milliseconds 500
   } elseif (Test-GatewayHealthy) {
-    return
+    Write-Step "Gateway already running and healthy"
+    return $true
   } elseif (Test-GatewayPort) {
     Write-Host "Gateway is running but not healthy. Restarting portable Gateway." -ForegroundColor Yellow
     Stop-Gateway
@@ -488,7 +571,7 @@ function Start-Gateway([switch]$Force) {
   Remove-Item -LiteralPath $GatewayLog, $GatewayErrLog -Force -ErrorAction SilentlyContinue
   Start-Process `
     -FilePath $NodeExe `
-    -ArgumentList (Join-ProcessArguments @($OpenClawEntry, "gateway", "run", "--port", "18789", "--bind", "loopback", "--auth", "none", "--verbose")) `
+    -ArgumentList (Join-ProcessArguments (@($OpenClawEntry) + (Get-GatewayRunArguments))) `
     -WorkingDirectory $Root `
     -RedirectStandardOutput $GatewayLog `
     -RedirectStandardError $GatewayErrLog `
@@ -499,20 +582,26 @@ function Start-Gateway([switch]$Force) {
   $lastStatus = -1
   while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 500
-    if (Test-GatewayHealthy) {
+    if (Test-GatewayReadyFromLog) {
       Show-GatewayLogTail
-      return
+      return $true
     }
 
     $elapsed = [Math]::Floor(120 - ($deadline - (Get-Date)).TotalSeconds)
     if ($elapsed -ge 0 -and ($elapsed % 10) -eq 0 -and $elapsed -ne $lastStatus) {
       $lastStatus = $elapsed
-      Write-Host ("Waiting for Gateway startup... {0}s/120s" -f $elapsed) -ForegroundColor DarkGray
+      $milestone = Get-GatewayStartupMilestone
+      if ($milestone) {
+        Write-Host ("Waiting for Gateway startup... {0}s/120s | {1}" -f $elapsed, $milestone) -ForegroundColor DarkGray
+      } else {
+        Write-Host ("Waiting for Gateway startup... {0}s/120s" -f $elapsed) -ForegroundColor DarkGray
+      }
     }
   }
 
   Write-Host "Gateway did not become healthy within 120s. Check logs\gateway-windows.log and logs\gateway-windows.err.log" -ForegroundColor Yellow
   Show-GatewayLogTail
+  return $false
 }
 
 function Show-Header {
@@ -533,10 +622,6 @@ function Pause-Menu {
   Read-Host "Press Enter to continue" | Out-Null
 }
 
-function Open-PortableShell {
-  powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -NoExit -Command "& '$PSScriptRoot\portable-env.ps1' -Root '$Root' -Platform '$Platform'; Set-Location '$Root'; Write-Host 'Portable OpenClaw shell'"
-}
-
 function Show-ToolsMenu {
   while ($true) {
     Show-Header
@@ -549,9 +634,8 @@ function Show-ToolsMenu {
     Write-Host "5. Channels"
     Write-Host "6. Logs"
     Write-Host "7. Update"
-    Write-Host "8. Portable Shell"
-    Write-Host "9. Stop Gateway"
-    Write-Host "10. Run OpenClaw Command"
+    Write-Host "8. Stop Gateway"
+    Write-Host "9. Run OpenClaw Command"
     Write-Host "0. Back"
     Write-Host
 
@@ -564,9 +648,8 @@ function Show-ToolsMenu {
       "5" { Invoke-OpenClaw @("channels", "status"); Pause-Menu }
       "6" { Show-GatewayLogTail; Pause-Menu }
       "7" { & $NpmCmd install --prefix $OpenClawPackageRoot openclaw@latest --ignore-scripts --loglevel=info --progress=false; Pause-Menu }
-      "8" { Open-PortableShell }
-      "9" { Stop-Gateway; Pause-Menu }
-      "10" { Invoke-OpenClawCommandPrompt; Pause-Menu }
+      "8" { Stop-Gateway; Pause-Menu }
+      "9" { Invoke-OpenClawCommandPrompt; Pause-Menu }
       "0" { return }
       default { Write-Host "Invalid option" -ForegroundColor Yellow; Start-Sleep -Seconds 1 }
     }
@@ -589,17 +672,17 @@ while ($true) {
   Write-Host "2. Chat"
   Write-Host "3. Dashboard"
   Write-Host "4. Tools"
-  Write-Host "5. Run OpenClaw Command"
+  Write-Host "5. Stop Gateway"
   Write-Host "0. Exit"
   Write-Host
 
   $choice = Read-Host "Select"
   switch ($choice) {
-    "1" { Invoke-OpenClaw @("configure", "--section", "model"); Start-Gateway -Force; Pause-Menu }
-    "2" { Start-Gateway; Invoke-OpenClaw @("tui"); Pause-Menu }
-    "3" { Start-Gateway; Invoke-OpenClaw @("dashboard"); Pause-Menu }
+    "1" { Invoke-OpenClaw @("configure", "--section", "model"); [void](Start-Gateway -Force); Pause-Menu }
+    "2" { if (Start-Gateway) { Invoke-OpenClaw (Add-GatewayClientAuthArguments @("tui")) }; Pause-Menu }
+    "3" { if (Start-Gateway) { Invoke-OpenClaw @("dashboard") }; Pause-Menu }
     "4" { Show-ToolsMenu }
-    "5" { Invoke-OpenClawCommandPrompt; Pause-Menu }
+    "5" { Stop-Gateway; Pause-Menu }
     "0" { exit 0 }
     default { Write-Host "Invalid option" -ForegroundColor Yellow; Start-Sleep -Seconds 1 }
   }

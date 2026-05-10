@@ -254,31 +254,123 @@ openclaw() {
   "$NODE_BIN" "$OPENCLAW_ENTRY" "$@"
 }
 
+gateway_setting() {
+  key=$1
+  fallback=$2
+  "$NODE_BIN" -e '
+const fs = require("fs");
+const key = process.argv[1];
+const fallback = process.argv[2] ?? "";
+let value;
+try {
+  const config = JSON.parse(fs.readFileSync(process.env.OPENCLAW_CONFIG_PATH, "utf8"));
+  value = key.split(".").reduce((acc, part) => acc && acc[part], config);
+} catch {}
+if (value === undefined || value === null || value === "") value = fallback;
+process.stdout.write(String(value));
+' "$key" "$fallback"
+}
+
+gateway_port() {
+  gateway_setting gateway.port 18789
+}
+
+gateway_bind() {
+  gateway_setting gateway.bind loopback
+}
+
+gateway_auth_mode() {
+  gateway_setting gateway.auth.mode none
+}
+
+gateway_token() {
+  gateway_setting gateway.auth.token ""
+}
+
+gateway_password() {
+  gateway_setting gateway.auth.password ""
+}
+
 gateway_port_running() {
-  "$NODE_BIN" -e "const net=require('net');const s=net.connect(18789,'127.0.0.1');s.setTimeout(500);s.on('connect',()=>{s.destroy();process.exit(0)});s.on('timeout',()=>{s.destroy();process.exit(1)});s.on('error',()=>process.exit(1));" >/dev/null 2>&1
+  port=$(gateway_port)
+  "$NODE_BIN" -e "const net=require('net');const port=Number(process.argv[1]);const s=net.connect(port,'127.0.0.1');s.setTimeout(500);s.on('connect',()=>{s.destroy();process.exit(0)});s.on('timeout',()=>{s.destroy();process.exit(1)});s.on('error',()=>process.exit(1));" "$port" >/dev/null 2>&1
 }
 
 gateway_healthy() {
-  gateway_port_running && openclaw gateway health >/dev/null 2>&1
+  gateway_port_running || return 1
+  mode=$(gateway_auth_mode)
+  case "$mode" in
+    token)
+      token=$(gateway_token)
+      [ -n "$token" ] && openclaw gateway health --timeout 2500 --token "$token" >/dev/null 2>&1
+      ;;
+    password)
+      password=$(gateway_password)
+      [ -n "$password" ] && openclaw gateway health --timeout 2500 --password "$password" >/dev/null 2>&1
+      ;;
+    *)
+      openclaw gateway health --timeout 2500 >/dev/null 2>&1
+      ;;
+  esac
+}
+
+gateway_ready_from_log() {
+  gateway_port_running || return 1
+  [ -f "$GATEWAY_LOG" ] || return 1
+  tail -n 80 "$GATEWAY_LOG" 2>/dev/null | grep -q '\[gateway\].*ready'
 }
 
 stop_gateway() {
+  stopped=0
   if [ -f "$ROOT/logs/gateway-$PLATFORM.pid" ]; then
     pid=$(cat "$ROOT/logs/gateway-$PLATFORM.pid" 2>/dev/null || true)
     if [ -n "$pid" ]; then
+      log "Stopping Gateway process: $pid"
       kill "$pid" >/dev/null 2>&1 || true
+      stopped=1
     fi
     rm -f "$ROOT/logs/gateway-$PLATFORM.pid"
+  fi
+  if [ "$stopped" -eq 0 ]; then
+    echo "Gateway is not running."
+  else
+    sleep 1
+    if gateway_port_running; then
+      echo "Gateway port is still open after stop attempt."
+    else
+      echo "Gateway stopped."
+    fi
   fi
 }
 
 show_gateway_log_tail() {
+  shown=0
   if [ -f "$GATEWAY_LOG" ]; then
     echo
     echo "--- OpenClaw Gateway log: logs/gateway-$PLATFORM.log ---"
     tail -n 40 "$GATEWAY_LOG"
     echo "--- end gateway log ---"
+    shown=1
   fi
+  native_log=$(find "$ROOT/data/temp/openclaw" -maxdepth 1 -type f -name 'openclaw-*.log' 2>/dev/null | sort | tail -n 1 || true)
+  if [ -n "$native_log" ]; then
+    echo
+    echo "--- OpenClaw native log: $native_log ---"
+    tail -n 40 "$native_log"
+    echo "--- end native log ---"
+    shown=1
+  fi
+  if [ "$shown" -eq 0 ]; then
+    echo
+    echo "No Gateway log files were created."
+  fi
+}
+
+gateway_startup_milestone() {
+  [ -f "$GATEWAY_LOG" ] || return 0
+  tail -n 25 "$GATEWAY_LOG" 2>/dev/null |
+    sed -n '/ready\|http server listening\|starting channels and sidecars\|loaded .* plugin\|starting HTTP server\|starting\.\.\./p' |
+    tail -n 1
 }
 
 start_gateway() {
@@ -287,7 +379,8 @@ start_gateway() {
     stop_gateway
     sleep 1
   elif gateway_healthy; then
-    return
+    log "Gateway already running and healthy"
+    return 0
   elif gateway_port_running; then
     log "Gateway is running but not healthy. Restarting portable Gateway."
     stop_gateway
@@ -295,24 +388,45 @@ start_gateway() {
   fi
 
   log "Starting Gateway"
-  nohup "$NODE_BIN" "$OPENCLAW_ENTRY" gateway run --port 18789 --bind loopback --auth none --verbose > "$GATEWAY_LOG" 2>&1 &
+  port=$(gateway_port)
+  bind=$(gateway_bind)
+  auth_mode=$(gateway_auth_mode)
+  case "$auth_mode" in
+    token)
+      token=$(gateway_token)
+      nohup "$NODE_BIN" "$OPENCLAW_ENTRY" gateway run --port "$port" --bind "$bind" --auth "$auth_mode" --token "$token" --verbose > "$GATEWAY_LOG" 2>&1 &
+      ;;
+    password)
+      password=$(gateway_password)
+      nohup "$NODE_BIN" "$OPENCLAW_ENTRY" gateway run --port "$port" --bind "$bind" --auth "$auth_mode" --password "$password" --verbose > "$GATEWAY_LOG" 2>&1 &
+      ;;
+    *)
+      nohup "$NODE_BIN" "$OPENCLAW_ENTRY" gateway run --port "$port" --bind "$bind" --auth "$auth_mode" --verbose > "$GATEWAY_LOG" 2>&1 &
+      ;;
+  esac
   echo "$!" > "$ROOT/logs/gateway-$PLATFORM.pid"
 
   elapsed=0
   while [ "$elapsed" -lt 120 ]; do
-    if gateway_healthy; then
+    if gateway_ready_from_log; then
       show_gateway_log_tail
       return
     fi
     sleep 2
     elapsed=$((elapsed + 2))
     if [ $((elapsed % 10)) -eq 0 ]; then
-      printf 'Waiting for Gateway startup... %ss/120s\n' "$elapsed"
+      milestone=$(gateway_startup_milestone)
+      if [ -n "$milestone" ]; then
+        printf 'Waiting for Gateway startup... %ss/120s | %s\n' "$elapsed" "$milestone"
+      else
+        printf 'Waiting for Gateway startup... %ss/120s\n' "$elapsed"
+      fi
     fi
   done
 
   echo "Gateway did not become healthy within 120s. Check logs/gateway-$PLATFORM.log"
   show_gateway_log_tail
+  return 1
 }
 
 pause_menu() {
@@ -336,11 +450,6 @@ show_header() {
   echo "------------------------------------------------------------------------"
 }
 
-portable_shell() {
-  echo "Portable OpenClaw shell. Type exit to return."
-  "${SHELL:-/bin/sh}"
-}
-
 run_openclaw_command() {
   echo
   echo "Paste OpenClaw command, for example:"
@@ -354,42 +463,13 @@ run_openclaw_command() {
     openclaw) return ;;
   esac
 
-  out_log="$ROOT/logs/openclaw-command.out.log"
-  err_log="$ROOT/logs/openclaw-command.err.log"
-  : > "$out_log"
-  : > "$err_log"
-
   echo
-  log "Running OpenClaw command. Timeout: 90s"
+  log "Running OpenClaw command live. Press Ctrl+C to stop it."
   # shellcheck disable=SC2086
-  openclaw $command_text > "$out_log" 2> "$err_log" &
-  command_pid=$!
-  elapsed=0
-  while kill -0 "$command_pid" 2>/dev/null && [ "$elapsed" -lt 90 ]; do
-    printf '\r[portable-openclaw] Command running | %02d:%02d | logs/openclaw-command.out.log' $((elapsed / 60)) $((elapsed % 60))
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-  printf '\n'
-
-  if kill -0 "$command_pid" 2>/dev/null; then
-    kill "$command_pid" >/dev/null 2>&1 || true
-    wait "$command_pid" >/dev/null 2>&1 || true
-    echo "OpenClaw command timed out after 90 seconds."
-  else
-    wait "$command_pid" || command_status=$?
-  fi
-
-  if [ -s "$out_log" ]; then
-    echo
-    echo "--- logs/openclaw-command.out.log ---"
-    tail -n 80 "$out_log"
-  fi
-  if [ -s "$err_log" ]; then
-    echo
-    echo "--- logs/openclaw-command.err.log ---"
-    tail -n 80 "$err_log"
-  fi
+  set +e
+  openclaw $command_text
+  command_status=$?
+  set -e
   if [ "${command_status:-0}" -ne 0 ]; then
     echo "OpenClaw command exited with code $command_status."
   fi
@@ -407,9 +487,8 @@ tools_menu() {
     echo "5. Channels"
     echo "6. Logs"
     echo "7. Update"
-    echo "8. Portable Shell"
-    echo "9. Stop Gateway"
-    echo "10. Run OpenClaw Command"
+    echo "8. Stop Gateway"
+    echo "9. Run OpenClaw Command"
     echo "0. Back"
     echo
     printf 'Select: '
@@ -422,9 +501,8 @@ tools_menu() {
       5) openclaw channels status; pause_menu ;;
       6) if [ -f "$GATEWAY_LOG" ]; then tail -n 80 -f "$GATEWAY_LOG"; else echo "No Gateway log yet."; pause_menu; fi ;;
       7) "$NPM_BIN" install --prefix "$OPENCLAW_PACKAGE_ROOT" openclaw@latest --ignore-scripts --loglevel=info --progress=false; pause_menu ;;
-      8) portable_shell ;;
-      9) stop_gateway; pause_menu ;;
-      10) run_openclaw_command; pause_menu ;;
+      8) stop_gateway; pause_menu ;;
+      9) run_openclaw_command; pause_menu ;;
       0) return ;;
       *) echo "Invalid option"; sleep 1 ;;
     esac
@@ -448,17 +526,23 @@ while :; do
   echo "2. Chat"
   echo "3. Dashboard"
   echo "4. Tools"
-  echo "5. Run OpenClaw Command"
+  echo "5. Stop Gateway"
   echo "0. Exit"
   echo
   printf 'Select: '
   read -r choice || exit 0
   case "$choice" in
-    1) openclaw configure --section model; start_gateway force; pause_menu ;;
-    2) start_gateway; openclaw tui; pause_menu ;;
-    3) start_gateway; openclaw dashboard; pause_menu ;;
+    1) openclaw configure --section model; start_gateway force || true; pause_menu ;;
+    2) if start_gateway; then
+         case "$(gateway_auth_mode)" in
+           token) token=$(gateway_token); openclaw tui --token "$token" ;;
+           password) password=$(gateway_password); openclaw tui --password "$password" ;;
+           *) openclaw tui ;;
+         esac
+       fi; pause_menu ;;
+    3) if start_gateway; then openclaw dashboard; fi; pause_menu ;;
     4) tools_menu ;;
-    5) run_openclaw_command; pause_menu ;;
+    5) stop_gateway; pause_menu ;;
     0) exit 0 ;;
     *) echo "Invalid option"; sleep 1 ;;
   esac
